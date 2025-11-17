@@ -277,6 +277,7 @@ def run_full_pipeline(
 
         if verbose:
             print(f"\n=== Fold {fold_idx}: train {train_start.date()} -> {train_end.date()} | "
+                  f"valid {valid_start.date()} -> {valid_end.date()}")
                   f"test {test_start.date()} -> {test_end.date()} ===")
 
         train_df = df[(df["orig_index"] >= train_start) & (df["orig_index"] <= train_end)]

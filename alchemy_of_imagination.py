@@ -272,20 +272,22 @@ def run_full_pipeline(
     combined_equity = []
     all_trades = []
 
-    # --- Iterate through folds
-    for fold_idx, (train_start, train_end, test_start, test_end) in enumerate(fold_splits, start=1):
+# --- Iterate through folds
+for fold_idx, (train_start, train_end, test_start, test_end) in enumerate(fold_splits, start=1):
 
-        if verbose:
-            print(f"\n=== Fold {fold_idx}: train {train_start.date()} -> {train_end.date()} | "
-                  f"valid {valid_start.date()} -> {valid_end.date()}")
-                  f"test {test_start.date()} -> {test_end.date()} ===")
+    if verbose:
+        print(
+            f"\n=== Fold {fold_idx}: train {train_start.date()} -> {train_end.date()} | "
+            f"valid {valid_start.date()} -> {valid_end.date()} | "
+            f"test {test_start.date()} -> {test_end.date()} ==="
+        )
 
-        train_df = df[(df["orig_index"] >= train_start) & (df["orig_index"] <= train_end)]
-        test_df = df[(df["orig_index"] > train_end) & (df["orig_index"] <= test_end)]
+    train_df = df[(df["orig_index"] >= train_start) & (df["orig_index"] <= train_end)]
+    test_df = df[(df["orig_index"] > train_end) & (df["orig_index"] <= test_end)]
 
-        if len(train_df) < 50 or len(test_df) < 10:
-            print(f"Skipping fold {fold_idx} — insufficient data.")
-            continue
+    if len(train_df) < 50 or len(test_df) < 10:
+        print(f"Skipping fold {fold_idx} — insufficient data.")
+        continue
 
         # --- Generate candidate parameter sets
         param_space = []

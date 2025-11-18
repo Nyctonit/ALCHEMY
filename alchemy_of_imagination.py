@@ -239,7 +239,7 @@ def run_full_pipeline(
     TEST_MONTHS=3,
     n_candidates=20,
     verbose=True
-):
+
     import pandas as pd
     import numpy as np
     import random

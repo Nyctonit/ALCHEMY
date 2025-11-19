@@ -1425,6 +1425,12 @@ class WalkForwardOrchestrator:
         self.meta_path = meta_path
         self.ep = EvolutionaryOptimizer()
         self.meta = self._load_meta()
+        self.ep = EvolutionaryOptimizer(
+             entry_mults=[0.3, 0.5, 0.7],
+             stop_mults=[1.0, 1.5, 2.0],
+             atr_periods=[14, 21]
+        )
+
 
     def _load_meta(self):
         if os.path.exists(self.meta_path):

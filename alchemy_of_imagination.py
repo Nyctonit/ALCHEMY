@@ -1040,7 +1040,7 @@ def features_from_fold(params, df_train):
     ]
 
 # -------------------------
-# Walk-forward orchestrator
+# Walk-forward orchestrator (param-bounds compatible)
 # -------------------------
 class WalkForwardOrchestrator:
     def __init__(self, pair="EURUSD=X", start="2018-01-01", end="2024-06-30",
@@ -1050,18 +1050,36 @@ class WalkForwardOrchestrator:
         self.pair = pair
         self.start = pd.Timestamp(start)
         self.end = pd.Timestamp(end)
-        self.ep = EvolutionaryOptimizer(entry_mults, stop_mults, atr_periods)
+
+        # build param_bounds from the (optional) list inputs so old callers still work
+        param_bounds = {
+            "entry_mult": (min(entry_mults), max(entry_mults)),
+            "stop_mult": (min(stop_mults), max(stop_mults)),
+            "atr_period": (min(atr_periods), max(atr_periods))
+        }
+        # use the new optimizer API
+        self.ep = EvolutionaryOptimizer(param_bounds)
         self.meta = MetaBrain()
+
         self.train_months = int(train_months)
         self.test_months = int(test_months)
         self.n_candidates = int(n_candidates)
         self.elite_keep = int(elite_keep)
         self.evolve_offspring = int(evolve_offspring)
-        self.mutation_intensity = 0.15  # was implicit ~0.3–0.5
-        self.meta_smoothing_window = 5  # folds
+        self.mutation_intensity = float(0.15)
+        self.meta_smoothing_window = int(5)
         self.use_meta_after = int(use_meta_after)
-        self.verbose = verbose
+        self.verbose = bool(verbose)
         self.meta_save_path = meta_save_path
+
+    def _sample_param_tuple(self):
+        """Return a param tuple in the same order used by features_from_fold: (entry, stop, atr)."""
+        pb = self.ep.param_bounds
+        return (
+            float(np.random.uniform(*pb["entry_mult"])),
+            float(np.random.uniform(*pb["stop_mult"])),
+            int(round(np.random.uniform(*pb["atr_period"])))
+        )
 
     def run(self):
         raw = yf.download(self.pair, start=self.start, end=self.end, progress=False, auto_adjust=True)
@@ -1069,19 +1087,23 @@ class WalkForwardOrchestrator:
         if raw.empty:
             raise ValueError("No market data downloaded.")
 
-        param_grid = [(e,s,ap) for e in self.ep.entry_mults for s in self.ep.stop_mults for ap in self.ep.atr_periods]
+        # initialize param population (list of tuples)
+        param_grid = [self._sample_param_tuple() for _ in range(max(1, self.n_candidates))]
         scores = {p: 0.0 for p in param_grid}
 
         # load meta if exists
         if self.meta_save_path and os.path.exists(self.meta_save_path):
             try:
                 self.meta = MetaBrain.load(self.meta_save_path)
-                if self.verbose: print("Loaded meta:", self.meta_save_path)
+                if self.verbose:
+                    print("Loaded meta:", self.meta_save_path)
             except Exception as e:
-                if self.verbose: print("Failed to load meta:", e)
+                if self.verbose:
+                    print("Failed to load meta:", e)
 
         # count folds
-        tmp_start = raw.index.min(); total_folds = 0
+        tmp_start = raw.index.min()
+        total_folds = 0
         while True:
             tmp_train_end = tmp_start + pd.DateOffset(months=self.train_months) - pd.DateOffset(days=1)
             tmp_test_start = tmp_train_end + pd.DateOffset(days=1)
@@ -1090,7 +1112,8 @@ class WalkForwardOrchestrator:
                 break
             total_folds += 1
             tmp_start = tmp_start + pd.DateOffset(months=self.test_months)
-        if self.verbose: print("Total walk-forward folds to run:", total_folds)
+        if self.verbose:
+            print("Total walk-forward folds to run:", total_folds)
 
         fold = 0
         train_start = raw.index.min()
@@ -1104,6 +1127,7 @@ class WalkForwardOrchestrator:
             test_end = test_start + pd.DateOffset(months=self.test_months) - pd.DateOffset(days=1)
             if test_end > raw.index.max():
                 break
+
             fold += 1
             if self.verbose:
                 print(f"\n=== Fold {fold}: train {train_start.date()} -> {train_end.date()} | test {test_start.date()} -> {test_end.date()} ===")
@@ -1115,20 +1139,25 @@ class WalkForwardOrchestrator:
                 continue
 
             vol30 = df_train["Close"].pct_change().rolling(20, min_periods=1).std().fillna(0)
-            median_vol = float(vol30.median()) if len(vol30)>0 else 0.0
+            median_vol = float(vol30.median()) if len(vol30) > 0 else 0.0
             df_train["regime_name"] = np.where(df_train["Close"].pct_change().rolling(20, min_periods=1).std().fillna(0) < median_vol, "calm_bull", "volatile_bear")
             df_test["regime_name"]  = np.where(df_test["Close"].pct_change().rolling(20, min_periods=1).std().fillna(0) < median_vol, "calm_bull", "volatile_bear")
 
-            # candidate selection
-            if len(self.meta.X) >= self.use_meta_after and self.meta.rf is not None:
+            # Candidate selection: either meta-ranked or random/sample from param_grid
+            if len(self.meta.X) >= self.use_meta_after and getattr(self.meta, "rf", None) is not None:
                 feats = [features_from_fold(p, df_train) for p in param_grid]
                 preds = self.meta.predict(feats)
                 ranked = sorted(zip(param_grid, preds), key=lambda x: x[1], reverse=True)
                 candidate_list = [p for p,_ in ranked[:min(self.n_candidates, len(ranked))]]
-                if self.verbose: print("Meta-selected candidates (top 6):", candidate_list[:6])
+                if self.verbose:
+                    print("Meta-selected candidates (top):", candidate_list[:min(6, len(candidate_list))])
             else:
+                # Ensure param_grid has at least n_candidates; fill if necessary
+                while len(param_grid) < self.n_candidates:
+                    param_grid.append(self._sample_param_tuple())
                 top_existing = sorted(scores.items(), key=lambda x: x[1], reverse=True)[:max(1, self.elite_keep)]
-                sampled = random.sample(param_grid, min(self.n_candidates - len(top_existing), len(param_grid)))
+                sampled_count = max(0, self.n_candidates - len(top_existing))
+                sampled = random.sample(param_grid, min(sampled_count, len(param_grid)))
                 candidate_list = [k for k,_ in top_existing] + sampled
                 # dedupe but keep order
                 seen = set(); dedup = []
@@ -1136,7 +1165,8 @@ class WalkForwardOrchestrator:
                     if c not in seen:
                         dedup.append(c); seen.add(c)
                 candidate_list = dedup[:self.n_candidates]
-                if self.verbose: print("Randomly sampled candidates count:", len(candidate_list))
+                if self.verbose:
+                    print("Randomly sampled candidates count:", len(candidate_list))
 
             evaluated = []
             for params in candidate_list:
@@ -1196,6 +1226,7 @@ class WalkForwardOrchestrator:
             if n_trades == 0:
                 reward -= 25.0
 
+            # update scores (keyed by tuple)
             scores[best_params] = scores.get(best_params, 0.0) + reward
 
             results.append({
@@ -1219,19 +1250,23 @@ class WalkForwardOrchestrator:
                 trades_test["fold"] = fold
                 all_trades.append(trades_test.reset_index(drop=True))
 
-            # evolve param grid
-            sorted_scores = sorted(scores.items(), key=lambda x:x[1], reverse=True)
+            # evolve param grid using EvolutionaryOptimizer
+            sorted_scores = sorted(scores.items(), key=lambda x: x[1], reverse=True)
             elites = [k for k,_ in sorted_scores[:self.elite_keep]]
             offspring = []
+            # set external guidance intensity (keeps original control)
+            self.ep.intensity = self.mutation_intensity
             for _ in range(self.evolve_offspring):
                 if elites:
                     p = random.choice(elites)
-                    offspring.append(self.ep.mutate(p, intensity=self.mutation_intensity))
+                    child = self.ep.mutate(p)  # mutate returns same-type tuple
+                    offspring.append(child)
             for off in offspring:
                 if off not in param_grid:
                     param_grid.append(off)
                     scores.setdefault(off, 0.0)
 
+            # advance time window
             train_start = train_start + pd.DateOffset(months=self.test_months)
 
         # save meta

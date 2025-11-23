@@ -1453,19 +1453,29 @@ class MetaBrain:
 # Walk-Forward Orchestrator (Adaptive AI)
 # -----------------------------
 class WalkForwardOrchestrator:
-    def __init__(self, pair="EURUSD=X", start="2018-01-01", end="2024-06-30", meta_path="meta_brain.joblib"):
+    def __init__(
+        self, 
+        pair="EURUSD=X", 
+        start="2018-01-01", 
+        end="2024-06-30", 
+        meta_path="meta_brain.joblib",
+        entry_mults=None,
+        stop_mults=None,
+        atr_periods=None
+    ):
         self.pair = pair
         self.start = start
         self.end = end
         self.meta_path = meta_path
-        self.ep = EvolutionaryOptimizer()
         self.meta = self._load_meta()
-        self.ep = EvolutionaryOptimizer(
-             entry_mults=[0.3, 0.5, 0.7],
-             stop_mults=[1.0, 1.5, 2.0],
-             atr_periods=[14, 21]
-        )
 
+        # Default parameter grids if not provided
+        self.entry_mults = entry_mults or [0.3, 0.5, 0.7]
+        self.stop_mults = stop_mults or [1.0, 1.5, 2.0]
+        self.atr_periods = atr_periods or [14, 21]
+
+        # Instantiate EvolutionaryOptimizer without unsupported kwargs
+        self.ep = EvolutionaryOptimizer()
 
     def _load_meta(self):
         if os.path.exists(self.meta_path):

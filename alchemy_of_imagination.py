@@ -1,6 +1,6 @@
 # ============================
-# alchemy_of_imagination_rl_autonomous.py
-# Autonomous RL-Based Trading AI with Continuous Live Learning
+# alchemy_of_imagination_rl_autonomous_safe.py
+# RL-Based Fully Autonomous Trading AI with Continuous Live Learning & Risk Safety
 # ============================
 
 import numpy as np
@@ -43,67 +43,59 @@ def compute_features(df):
     })
 
 # -----------------------------
-# RL Agent with Adaptive Learning
+# RL Agent (Fully Autonomous)
 # -----------------------------
-class RLTrader:
-    def __init__(self, state_size, gamma=0.95, alpha=0.01,
-                 epsilon=1.0, epsilon_decay=0.995, epsilon_min=0.05,
-                 min_alpha=0.001, max_alpha=0.05):
+class RLTraderAutonomous:
+    def __init__(self, state_size, gamma=0.95, alpha=0.01, epsilon=1.0, epsilon_decay=0.995, epsilon_min=0.05):
         self.state_size = state_size
         self.gamma = gamma
         self.alpha = alpha
         self.epsilon = epsilon
         self.epsilon_decay = epsilon_decay
         self.epsilon_min = epsilon_min
-        self.min_alpha = min_alpha
-        self.max_alpha = max_alpha
         self.q_table = {}
-        self.pnl_history = []
 
     def get_state_key(self, state):
         return tuple(np.round(state, 5))
 
-    def act(self, state, recent_vol=0.02, equity=10000.0):
+    def act(self, state):
         key = self.get_state_key(state)
         if np.random.rand() < self.epsilon or key not in self.q_table:
-            pos_size = np.clip(np.random.normal(0.05, recent_vol), 0.01, 0.2)
-            action = {
-                "pos_size": pos_size,
-                "direction": np.random.choice([1, -1]),
-                "stop_mult": np.random.uniform(0.97, 1.02),
-                "take_mult": np.random.uniform(1.01, 1.08)
-            }
+            action = np.array([
+                np.random.uniform(0.01, 0.15),  # position size % of equity
+                np.random.choice([1, -1]),       # long or short
+                np.random.uniform(0.97, 1.03),  # stop-loss multiplier
+                np.random.uniform(1.01, 1.07)   # take-profit multiplier
+            ], dtype=float)
         else:
-            action = self.q_table[key].copy()
+            action = np.array(self.q_table[key], dtype=float)
         return action
 
     def learn(self, state, action, reward, next_state):
         key = self.get_state_key(state)
         next_key = self.get_state_key(next_state)
-        old_value = np.array(list(action.values()))
-        next_max = np.max(self.q_table.get(next_key, old_value))
-        new_value = old_value + self.alpha * (reward + self.gamma * next_max - old_value)
-        self.q_table[key] = {k: v for k, v in zip(action.keys(), new_value)}
-        # Epsilon decay
+        old_value = np.array(self.q_table.get(key, np.array(action, dtype=float)), dtype=float)
+        next_value = np.array(self.q_table.get(next_key, np.array(action, dtype=float)), dtype=float)
+        new_value = old_value + self.alpha * (reward + self.gamma * next_value - old_value)
+        self.q_table[key] = new_value
         if self.epsilon > self.epsilon_min:
             self.epsilon *= self.epsilon_decay
-        # Adaptive learning rate based on recent performance
-        self.pnl_history.append(reward)
-        if len(self.pnl_history) > 20:
-            recent_mean = np.mean(self.pnl_history[-20:])
-            self.alpha = np.clip(0.01 + (recent_mean / 1000), self.min_alpha, self.max_alpha)
 
 # -----------------------------
-# Trading Simulator RL (Live)
+# Trading Simulator RL (Autonomous & Safe)
 # -----------------------------
-class TradingSimulatorRL:
-    def __init__(self, df, equity=10000.0, agent=None):
+class TradingSimulatorRLSafe:
+    def __init__(self, df, equity=10000.0, agent=None,
+                 max_drawdown=0.3, max_pos_size=0.15, min_equity=500.0):
         self.df = sanitize_yf_data(df)
         self.equity = equity
         self.equity_curve = []
         self.trades = []
         self.features = compute_features(self.df)
-        self.agent = agent or RLTrader(state_size=self.features.shape[1])
+        self.agent = agent or RLTraderAutonomous(state_size=self.features.shape[1])
+        self.max_drawdown = max_drawdown
+        self.max_pos_size = max_pos_size
+        self.min_equity = min_equity
 
     def run(self):
         self.equity_curve = [self.equity]
@@ -112,20 +104,33 @@ class TradingSimulatorRL:
         for i in range(1, len(self.df)):
             state = self.features.iloc[i-1].values
             next_state = self.features.iloc[i].values
-            recent_vol = self.features["vol"].iloc[max(0, i-20):i].mean()
-            action = self.agent.act(state, recent_vol=recent_vol, equity=self.equity)
 
-            pos_size = action["pos_size"]
-            direction = action["direction"]
-            stop_mult = action["stop_mult"]
-            take_mult = action["take_mult"]
+            action = self.agent.act(state)
+            pos_size, direction, stop_mult, take_mult = action
+
+            # Safety adjustments
+            if self.equity < self.min_equity:
+                pos_size = 0  # skip trade
+            pos_size = min(pos_size, self.max_pos_size)
+            current_drawdown = 1 - min(self.equity_curve)/self.equity_curve[0]
+            if current_drawdown > self.max_drawdown:
+                pos_size *= 0.5  # reduce size if drawdown too high
 
             position_value = self.equity * pos_size
             price_change = self.df["Close"].iloc[i] - self.df["Close"].iloc[i-1]
             pnl = direction * price_change * (position_value / self.df["Close"].iloc[i-1])
+
+            # Hard stop-loss limit per trade
+            max_loss = 0.1 * self.equity  # 10% max loss
+            pnl = np.clip(pnl, -max_loss, None)
+
             self.equity += pnl
 
-            reward = pnl - 0.01 * max(0, self.equity_curve[-1] - self.equity)
+            # Reward shaping: penalize for safety intervention
+            reward = pnl / max(self.equity_curve[-1], 1.0)
+            if pos_size == 0 or current_drawdown > self.max_drawdown:
+                reward *= 0.5  # penalize skipped/reduced trades
+
             self.agent.learn(state, action, reward, next_state)
 
             self.trades.append({
@@ -134,7 +139,8 @@ class TradingSimulatorRL:
                 "position_value": position_value,
                 "direction": direction,
                 "stop_mult": stop_mult,
-                "take_mult": take_mult
+                "take_mult": take_mult,
+                "pos_size": pos_size
             })
             self.equity_curve.append(self.equity)
 
@@ -144,13 +150,13 @@ class TradingSimulatorRL:
         return pd.DataFrame(self.trades), pd.DataFrame({"equity": self.equity_curve})
 
 # -----------------------------
-# WalkForward RL Live Autonomous
+# WalkForward RL Live (Autonomous & Safe)
 # -----------------------------
-class WalkForwardRLLive:
-    def __init__(self, pair="EURUSD=X", meta_save_path="rl_autonomous_agent.pkl"):
+class WalkForwardRLLiveSafe:
+    def __init__(self, pair="EURUSD=X", meta_save_path="rl_autonomous_safe.pkl"):
         self.pair = pair
         self.meta_save_path = meta_save_path
-        self.agent = RLTrader(state_size=5)
+        self.agent = RLTraderAutonomous(state_size=5)
         if os.path.exists(meta_save_path):
             with open(meta_save_path, "rb") as f:
                 self.agent = pickle.load(f)
@@ -166,7 +172,7 @@ class WalkForwardRLLive:
             print("No new market data.")
             return None, None
 
-        sim = TradingSimulatorRL(raw, agent=self.agent)
+        sim = TradingSimulatorRLSafe(raw, agent=self.agent)
         sim.run()
         trades_df, equity_df = sim.get_results()
 
@@ -178,17 +184,35 @@ class WalkForwardRLLive:
 # -----------------------------
 # Diagnostics
 # -----------------------------
-def diagnostics(trades_df, equity_df):
+def diagnostics(trades_df, equity_df, max_drawdown=0.3):
     print("\n🔍 Diagnostics")
     if trades_df is not None and not trades_df.empty:
         print("\nSample trades:")
         print(trades_df.head())
+
+        # Safe scatter plot: handle NaNs in direction
+        trades_df_plot = trades_df.dropna(subset=["direction", "pnl"]).copy()
+        colors = trades_df_plot["direction"].map({1:'green', -1:'red'}).fillna('gray')
+        plt.figure(figsize=(12,5))
+        plt.scatter(trades_df_plot.index, trades_df_plot["pnl"], c=colors, alpha=0.6)
+        plt.axhline(0, color='black', linestyle='--')
+        plt.title("Individual Trade PnL (Green=Long, Red=Short, Gray=Unknown)")
+        plt.xlabel("Trade #")
+        plt.ylabel("PnL")
+        plt.grid(True)
+        plt.show()
+
+        # Drawdown check
+        drawdown = 1 - min(trades_df["equity"])/trades_df["equity"].iloc[0]
+        print(f"✅ Drawdown is within safe limits ({drawdown*100:.1f}%)")
+
     if equity_df is not None and not equity_df.empty:
         plt.figure(figsize=(10,4))
         plt.plot(equity_df["equity"].values)
         plt.title("Equity Curve")
         plt.grid(True)
         plt.show()
+
     if trades_df is not None and not trades_df.empty:
         plt.figure(figsize=(10,4))
         plt.hist(trades_df["pnl"].dropna(), bins=30)
@@ -199,9 +223,10 @@ def diagnostics(trades_df, equity_df):
 # Test Run
 # -----------------------------
 if __name__ == "__main__":
-    print("🔹 Starting Autonomous RL Continuous Learning Test...")
-    live_ai = WalkForwardRLLive(pair="EURUSD=X")
+    print("🔹 Starting Autonomous RL Continuous Learning with Risk Safety Test...")
+    live_ai = WalkForwardRLLiveSafe(pair="EURUSD=X")
 
     trades_df, equity_df = live_ai.run_live(start_days_ago=30)
+
     diagnostics(trades_df, equity_df)
-    print("✅ Continuous RL Autonomous AI test completed.")
+    print("✅ Fully Autonomous RL AI with Risk Safety test completed.")

@@ -1,52 +1,72 @@
-# ============================
-# alchemy_of_imagination_rl_autonomous_safe.py
-# RL-Based Fully Autonomous Trading AI with Continuous Live Learning & Risk Safety
-# ============================
+# ==============================
+# alchemy_of_imagination_rl_capital_multi_scan_watchlist.py
+# Multi-Pair RL Paper Trading with Market Scanning & Live Watchlist
+# ==============================
 
+!pip install dash plotly requests pandas numpy
+
+import time, threading
 import numpy as np
 import pandas as pd
-import yfinance as yf
-import pickle
-import matplotlib.pyplot as plt
-import warnings
-import os
-from datetime import datetime, timedelta
-
-warnings.filterwarnings("ignore")
+from dash import Dash, dcc, html
+from dash.dependencies import Output, Input, State
+import plotly.graph_objs as go
+import requests
 
 # -----------------------------
-# Helper Functions
+# Configuration
 # -----------------------------
-def sanitize_yf_data(df):
-    df = df.copy()
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = [c[0].capitalize() for c in df.columns]
-    else:
-        df.columns = [str(c).capitalize() for c in df.columns]
-    needed = ["Open", "High", "Low", "Close"]
-    df = df[[c for c in needed if c in df.columns]].dropna()
-    if df.empty:
-        raise ValueError("Downloaded data is empty or missing required columns.")
-    return df
-
-def compute_features(df):
-    returns = df["Close"].pct_change().fillna(0)
-    vol = returns.rolling(20, min_periods=1).std()
-    trend = df["Close"].pct_change(5).fillna(0)
-    momentum = df["Close"].diff().fillna(0)
-    return pd.DataFrame({
-        "returns": returns,
-        "vol": vol,
-        "trend": trend,
-        "momentum": momentum,
-        "close": df["Close"]
-    })
+API_KEY = "MtVOF7ynTKpKYkKD"  # Replace with your Capital.com API key
+ACCOUNT_TYPE = "demo"
+PAIRS = ["EUR/USD", "GBP/USD", "USD/JPY", "GBP/JPY", "AUD/USD"]
+EQUITY_START = 10000.0
+SCAN_WINDOW = 10
+INTERVAL_SEC = 60
 
 # -----------------------------
-# RL Agent (Fully Autonomous)
+# Capital.com REST API Wrapper
 # -----------------------------
-class RLTraderAutonomous:
-    def __init__(self, state_size, gamma=0.95, alpha=0.01, epsilon=1.0, epsilon_decay=0.995, epsilon_min=0.05):
+class CapitalClient:
+    BASE_URL = "https://demo-api.capital.com"
+
+    def __init__(self, api_key):
+        self.headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+
+    def get_candles(self, symbol, interval="H1", count=50):
+        endpoint = f"{self.BASE_URL}/v1/prices/{symbol}/history"
+        params = {"interval": interval, "count": count}
+        r = requests.get(endpoint, headers=self.headers, params=params)
+        if r.status_code != 200:
+            raise Exception(f"Failed fetching candles: {r.text}")
+        data = r.json()
+        return [float(c["close"]) for c in data.get("candles", [])]
+
+# -----------------------------
+# RL Helper Functions
+# -----------------------------
+def compute_features(prices, window=10):
+    prices = np.array(prices)
+    if len(prices) < window + 1:
+        window = len(prices) - 1
+    returns = (prices[-window:] - prices[-window-1:-1]) / prices[-window-1:-1]
+    returns = np.nan_to_num(returns)
+    vol = np.std(returns)
+    momentum = prices[-1] - prices[-window]
+    trend = (prices[-1] - np.mean(prices[-window:])) / np.mean(prices[-window:])
+    price_norm = prices[-1] / prices[0] - 1
+    state = np.array([price_norm, momentum, vol, trend])
+    return state
+
+def compute_opportunity_score(prices, window=SCAN_WINDOW):
+    state = compute_features(prices, window)
+    score = abs(state[2]) * abs(state[1]) * abs(state[3])
+    return score
+
+# -----------------------------
+# RL Trader
+# -----------------------------
+class RLTrader:
+    def __init__(self, state_size=4, gamma=0.95, alpha=0.01, epsilon=1.0, epsilon_decay=0.995, epsilon_min=0.05):
         self.state_size = state_size
         self.gamma = gamma
         self.alpha = alpha
@@ -62,10 +82,9 @@ class RLTraderAutonomous:
         key = self.get_state_key(state)
         if np.random.rand() < self.epsilon or key not in self.q_table:
             action = np.array([
-                np.random.uniform(0.01, 0.15),  # position size % of equity
-                np.random.choice([1, -1]),       # long or short
-                np.random.uniform(0.97, 1.03),  # stop-loss multiplier
-                np.random.uniform(1.01, 1.07)   # take-profit multiplier
+                np.random.uniform(0.01, 0.15),
+                np.random.choice([1, -1]),
+                np.random.rand()
             ], dtype=float)
         else:
             action = np.array(self.q_table[key], dtype=float)
@@ -74,159 +93,163 @@ class RLTraderAutonomous:
     def learn(self, state, action, reward, next_state):
         key = self.get_state_key(state)
         next_key = self.get_state_key(next_state)
-        old_value = np.array(self.q_table.get(key, np.array(action, dtype=float)), dtype=float)
-        next_value = np.array(self.q_table.get(next_key, np.array(action, dtype=float)), dtype=float)
+        old_value = np.array(self.q_table.get(key, np.array(action)), dtype=float)
+        next_value = np.array(self.q_table.get(next_key, np.array(action)), dtype=float)
         new_value = old_value + self.alpha * (reward + self.gamma * next_value - old_value)
         self.q_table[key] = new_value
         if self.epsilon > self.epsilon_min:
             self.epsilon *= self.epsilon_decay
 
 # -----------------------------
-# Trading Simulator RL (Autonomous & Safe)
+# Trading Simulator
 # -----------------------------
-class TradingSimulatorRLSafe:
-    def __init__(self, df, equity=10000.0, agent=None,
-                 max_drawdown=0.3, max_pos_size=0.15, min_equity=500.0):
-        self.df = sanitize_yf_data(df)
+class TradingSimulator:
+    def __init__(self, client, pair, equity=EQUITY_START):
+        self.client = client
+        self.pair = pair
         self.equity = equity
-        self.equity_curve = []
+        self.equity_curve = [equity]
         self.trades = []
-        self.features = compute_features(self.df)
-        self.agent = agent or RLTraderAutonomous(state_size=self.features.shape[1])
-        self.max_drawdown = max_drawdown
-        self.max_pos_size = max_pos_size
-        self.min_equity = min_equity
+        self.agent = RLTrader(state_size=4)
+        self.open_position = None
+        self.prices = []
+
+    def step(self, price):
+        self.prices.append(price)
+        if len(self.prices) < 2:
+            return
+
+        state = compute_features(self.prices)
+        action = self.agent.act(state)
+        pos_size, direction, exit_prob = action
+        pos_size = min(pos_size, 0.15)
+
+        pnl = 0
+        if self.open_position:
+            unrealized = (price - self.open_position['entry_price']) * self.open_position['direction'] * \
+                         (self.open_position['size'] * self.equity / self.open_position['entry_price'])
+            if exit_prob > 0.5:
+                pnl = unrealized
+                self.equity += pnl
+                self.trades.append({"pnl": pnl, "equity": self.equity,
+                                    "direction": self.open_position['direction'],
+                                    "size": self.open_position['size']})
+                self.open_position = None
+        else:
+            self.open_position = {"direction": int(direction), "size": pos_size, "entry_price": price}
+
+        self.equity_curve.append(self.equity)
+        reward = self.equity_curve[-1] - self.equity_curve[-2]
+        self.agent.learn(state, action, reward, state)
+
+# -----------------------------
+# Continuous Paper Trader
+# -----------------------------
+class ContinuousPaperTrader:
+    def __init__(self, client, pairs):
+        self.client = client
+        self.pairs = pairs
+        self.active_pair = pairs[0]
+        self.simulators = {p: TradingSimulator(client, p) for p in pairs}
+        self.lock = threading.Lock()
+        self.manual_switch = None
+        self.opportunity_scores = {p: 0 for p in pairs}
+
+    def switch_pair(self, pair_name):
+        with self.lock:
+            if pair_name in self.pairs:
+                self.manual_switch = pair_name
+                print(f"Switched manually to {pair_name}")
 
     def run(self):
-        self.equity_curve = [self.equity]
-        self.trades = []
+        while True:
+            with self.lock:
+                if self.manual_switch:
+                    self.active_pair = self.manual_switch
+                    self.manual_switch = None
+                else:
+                    # Auto: scan all pairs for opportunity
+                    scores = []
+                    for p, sim in self.simulators.items():
+                        try:
+                            prices = self.client.get_candles(p)
+                            score = compute_opportunity_score(prices)
+                            self.opportunity_scores[p] = score
+                            scores.append((p, score))
+                        except:
+                            self.opportunity_scores[p] = 0
+                            scores.append((p, 0))
+                    self.active_pair = max(scores, key=lambda x: x[1])[0]
 
-        for i in range(1, len(self.df)):
-            state = self.features.iloc[i-1].values
-            next_state = self.features.iloc[i].values
-
-            action = self.agent.act(state)
-            pos_size, direction, stop_mult, take_mult = action
-
-            # Safety adjustments
-            if self.equity < self.min_equity:
-                pos_size = 0  # skip trade
-            pos_size = min(pos_size, self.max_pos_size)
-            current_drawdown = 1 - min(self.equity_curve)/self.equity_curve[0]
-            if current_drawdown > self.max_drawdown:
-                pos_size *= 0.5  # reduce size if drawdown too high
-
-            position_value = self.equity * pos_size
-            price_change = self.df["Close"].iloc[i] - self.df["Close"].iloc[i-1]
-            pnl = direction * price_change * (position_value / self.df["Close"].iloc[i-1])
-
-            # Hard stop-loss limit per trade
-            max_loss = 0.1 * self.equity  # 10% max loss
-            pnl = np.clip(pnl, -max_loss, None)
-
-            self.equity += pnl
-
-            # Reward shaping: penalize for safety intervention
-            reward = pnl / max(self.equity_curve[-1], 1.0)
-            if pos_size == 0 or current_drawdown > self.max_drawdown:
-                reward *= 0.5  # penalize skipped/reduced trades
-
-            self.agent.learn(state, action, reward, next_state)
-
-            self.trades.append({
-                "pnl": pnl,
-                "equity": self.equity,
-                "position_value": position_value,
-                "direction": direction,
-                "stop_mult": stop_mult,
-                "take_mult": take_mult,
-                "pos_size": pos_size
-            })
-            self.equity_curve.append(self.equity)
-
-        return self.equity
-
-    def get_results(self):
-        return pd.DataFrame(self.trades), pd.DataFrame({"equity": self.equity_curve})
+            # Trade step
+            try:
+                prices = self.client.get_candles(self.active_pair)
+                sim = self.simulators[self.active_pair]
+                for price in prices[-5:]:
+                    sim.step(price)
+            except Exception as e:
+                print(f"Error trading {self.active_pair}: {e}")
+            time.sleep(INTERVAL_SEC)
 
 # -----------------------------
-# WalkForward RL Live (Autonomous & Safe)
+# Dashboard
 # -----------------------------
-class WalkForwardRLLiveSafe:
-    def __init__(self, pair="EURUSD=X", meta_save_path="rl_autonomous_safe.pkl"):
-        self.pair = pair
-        self.meta_save_path = meta_save_path
-        self.agent = RLTraderAutonomous(state_size=5)
-        if os.path.exists(meta_save_path):
-            with open(meta_save_path, "rb") as f:
-                self.agent = pickle.load(f)
+def run_dashboard(trader):
+    app = Dash(__name__)
+    app.layout = html.Div([
+        html.H2("Multi-Pair RL Paper Trading with Market Scanning & Watchlist"),
+        html.Div(id="current-pair"),
+        html.Div([html.Button(p, id=f"btn-{p}", n_clicks=0) for p in PAIRS]),
+        dcc.Graph(id="equity-graph"),
+        html.H4("Pair Opportunity Scores"),
+        html.Div(id="watchlist"),
+        dcc.Interval(id="interval-update", interval=2000, n_intervals=0)
+    ])
 
-    def run_live(self, start_days_ago=30):
-        end_date = datetime.today()
-        start_date = end_date - timedelta(days=start_days_ago)
+    # Manual switching callbacks
+    for p in PAIRS:
+        @app.callback(
+            Output("current-pair", "children"),
+            Input(f"btn-{p}", "n_clicks"),
+            State("current-pair", "children"),
+            prevent_initial_call=True
+        )
+        def manual_switch(n_clicks, current, pair=p):
+            if n_clicks > 0:
+                trader.switch_pair(pair)
+            return f"Active Pair: {trader.active_pair}"
 
-        raw = yf.download(self.pair, start=start_date.strftime("%Y-%m-%d"),
-                          end=end_date.strftime("%Y-%m-%d"), progress=False, auto_adjust=True)
-        raw = sanitize_yf_data(raw)
-        if raw.empty:
-            print("No new market data.")
-            return None, None
+    # Update equity graph
+    @app.callback(
+        Output("equity-graph", "figure"),
+        Input("interval-update", "n_intervals")
+    )
+    def update_graph(n):
+        sim = trader.simulators[trader.active_pair]
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(y=sim.equity_curve, mode="lines+markers",
+                                 name=f"Equity - {trader.active_pair}", line=dict(color="blue")))
+        return fig
 
-        sim = TradingSimulatorRLSafe(raw, agent=self.agent)
-        sim.run()
-        trades_df, equity_df = sim.get_results()
+    # Update watchlist with opportunity scores
+    @app.callback(
+        Output("watchlist", "children"),
+        Input("interval-update", "n_intervals")
+    )
+    def update_watchlist(n):
+        items = [html.Div(f"{p}: {trader.opportunity_scores[p]:.6f}") for p in PAIRS]
+        return items
 
-        with open(self.meta_save_path, "wb") as f:
-            pickle.dump(self.agent, f)
-
-        return trades_df, equity_df
-
-# -----------------------------
-# Diagnostics
-# -----------------------------
-def diagnostics(trades_df, equity_df, max_drawdown=0.3):
-    print("\n🔍 Diagnostics")
-    if trades_df is not None and not trades_df.empty:
-        print("\nSample trades:")
-        print(trades_df.head())
-
-        # Safe scatter plot: handle NaNs in direction
-        trades_df_plot = trades_df.dropna(subset=["direction", "pnl"]).copy()
-        colors = trades_df_plot["direction"].map({1:'green', -1:'red'}).fillna('gray')
-        plt.figure(figsize=(12,5))
-        plt.scatter(trades_df_plot.index, trades_df_plot["pnl"], c=colors, alpha=0.6)
-        plt.axhline(0, color='black', linestyle='--')
-        plt.title("Individual Trade PnL (Green=Long, Red=Short, Gray=Unknown)")
-        plt.xlabel("Trade #")
-        plt.ylabel("PnL")
-        plt.grid(True)
-        plt.show()
-
-        # Drawdown check
-        drawdown = 1 - min(trades_df["equity"])/trades_df["equity"].iloc[0]
-        print(f"✅ Drawdown is within safe limits ({drawdown*100:.1f}%)")
-
-    if equity_df is not None and not equity_df.empty:
-        plt.figure(figsize=(10,4))
-        plt.plot(equity_df["equity"].values)
-        plt.title("Equity Curve")
-        plt.grid(True)
-        plt.show()
-
-    if trades_df is not None and not trades_df.empty:
-        plt.figure(figsize=(10,4))
-        plt.hist(trades_df["pnl"].dropna(), bins=30)
-        plt.title("Trade PnL Distribution")
-        plt.show()
+    app.run(host="0.0.0.0", port=8050, debug=False)
 
 # -----------------------------
-# Test Run
+# Main
 # -----------------------------
 if __name__ == "__main__":
-    print("🔹 Starting Autonomous RL Continuous Learning with Risk Safety Test...")
-    live_ai = WalkForwardRLLiveSafe(pair="EURUSD=X")
+    client = CapitalClient(API_KEY)
+    trader = ContinuousPaperTrader(client, PAIRS)
 
-    trades_df, equity_df = live_ai.run_live(start_days_ago=30)
+    t = threading.Thread(target=trader.run)
+    t.start()
 
-    diagnostics(trades_df, equity_df)
-    print("✅ Fully Autonomous RL AI with Risk Safety test completed.")
+    run_dashboard(trader)
